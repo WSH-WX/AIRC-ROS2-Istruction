@@ -14,7 +14,7 @@ from typing import Optional, Tuple, Dict, Any
 import math
 import torch
 
-from .ray import compute_ray_defaults
+from env.ray import compute_ray_defaults
 
 
 def _wrap_angle_pi(yaw: torch.Tensor) -> torch.Tensor:

@@ -20,7 +20,7 @@ from typing import Any, Dict, Optional
 import torch
 
 from env import load_json_config
-from env.sim_gpu_env import SimGPUEnvConfig, SimRandomGPUBatchEnv
+from eval.legacy_sim_gpu_env import SimGPUEnvConfig, SimRandomGPUBatchEnv
 
 
 def build_sim_cfg(env_cfg: Dict[str, Any], n_envs: int, device: str) -> SimGPUEnvConfig:

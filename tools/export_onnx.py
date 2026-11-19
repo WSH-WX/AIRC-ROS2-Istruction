@@ -2,7 +2,7 @@
 """Export a trained PPO checkpoint (.pt) into a self-contained ``model/`` folder.
 
 The folder this script produces is everything the simulation side needs to run
-the policy without any GRALP source on hand:
+the policy without any AIRC-ROS2-Istruction source on hand:
 
     model/
       policy.pt    a copy of the source checkpoint
@@ -48,7 +48,7 @@ if str(REPO_ROOT) not in sys.path:
 
 CONFIG_DIR = REPO_ROOT / "config"
 POSE_DIM = 7
-ACTION_DIM = 2  # GRALP actions are (vx, omega); limits below assume this layout
+ACTION_DIM = 2  # AIRC-ROS2-Istruction actions are (vx, omega); limits below assume this layout
 
 
 def _load_json(path: Path) -> dict:

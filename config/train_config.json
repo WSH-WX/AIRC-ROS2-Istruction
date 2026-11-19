@@ -4,7 +4,7 @@
     "model_config":  "model_config.json",
     "model":  "circular_attn",
     "sampling":  {
-                     "batch_env":  2048,
+                     "batch_env":  8,
                      "rollout_len":  256,
                      "reset_each_rollout": true
                  },
@@ -19,7 +19,7 @@
                 "value_coef":  0.5,
                 "max_grad_norm":  0.5,
                 "epochs":  1,
-                "minibatch_size":  16384,
+                "minibatch_size":  1024,
                 "amp":  true,
                 "amp_bf16":  true,
                 "collision_done":  true,
@@ -27,7 +27,7 @@
                 "log_std_max": 2.0
             },
     "run":  {
-                "total_env_steps":  80000000000,
+                "total_env_steps":  2000000,
                 "ckpt_dir":  "runs",
                 "log_interval":  500,
                 "save_interval":  20000

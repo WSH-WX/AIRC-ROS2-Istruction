@@ -38,7 +38,7 @@ import math
 import numpy as np
 import torch
 
-from env.sim_gpu_env import SimGPUEnvConfig, SimRandomGPUBatchEnv, _wrap_angle_pi
+from eval.legacy_sim_gpu_env import SimGPUEnvConfig, SimRandomGPUBatchEnv, _wrap_angle_pi
 
 from .narrow_channel_scene import NarrowChannelMap
 

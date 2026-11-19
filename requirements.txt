@@ -1,5 +1,8 @@
 # Core runtime deps for training/inference
 numpy>=1.21
+gymnasium>=1.0
+mujoco>=3.2
+tensorboard>=2.14
 onnx>=1.14
 onnxruntime>=1.18  # swap to onnxruntime-gpu if running ONNX export/inference on CUDA/TRT
 

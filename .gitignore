@@ -22,3 +22,8 @@ __pycache__/
 # OS
 .DS_Store
 Thumbs.db
+
+# Local training outputs and scratch files
+/runs/*
+!/runs/.gitkeep
+/work/

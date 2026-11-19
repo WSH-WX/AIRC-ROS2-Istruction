@@ -1,25 +1,21 @@
-# GRALP
+# AIRC-ROS2-Istruction
 
-GRALP 是一个面向移动机器人局部导航与轨迹规划的轻量级 PPO 策略训练仓库。项目以二维激光雷达距离作为主要外部感知输入，不依赖相机、深度图、语义检测、全局地图或局部栅格，策略在批量随机化的射线环境中学习从局部观测到连续速度指令的映射。
+AIRC-ROS2-Istruction 是一个面向移动机器人局部导航的 PPO 训练项目。当前训练环境使用 MuJoCo 表示围墙、随机箱形障碍、机器人和目标点，并用 2D LiDAR 射线构造策略观测。环境遵循 Gymnasium 的 `reset/step` 接口，也提供 PPO 使用的批量适配器。
 
-核心目标是用尽量紧凑的观测和网络结构，在低成本差速移动平台上生成满足速度约束、避碰约束和控制平滑性的局部可执行轨迹。
+![AIRC-ROS2-Istruction cover](assets/cover.jpg)
 
-![GRALP cover](assets/cover.jpg)
+## 环境与策略
 
-## 方法概览
+每个 episode 都会随机生成一张封闭场地地图、障碍物、起点、机器人朝向和目标点。地图与 LiDAR 查询使用 MuJoCo；机器人按差速运动学更新位姿，碰撞使用圆形机器人 footprint 与墙体、障碍物进行几何检查。碰撞和到达目标会结束 episode，超过最大步数会截断 episode。
 
-每个控制周期中，环境提供一圈归一化二维激光射线距离、局部目标方向和短时控制历史。策略输出差速平台的连续动作 `(vx, omega)`，动作经 `tanh` 压缩后按轴映射到物理速度边界。连续动作序列再通过差速运动学积分，形成滚动局部轨迹。
+这是适合讲解 PPO、观测、奖励和地图随机化的轻量二维场景。它没有模拟车轮动力学、惯性、打滑或传感器噪声；需要研究这些效应时，应继续扩展机器人模型和接触动力学。
 
-本文方法对应的主干网络是 `cnn_zeropad`：射线分支使用零填充空洞一维卷积提取几何特征，姿态-历史分支使用小型 MLP 编码 7 维辅助状态，两路特征融合后共享给策略头和价值头。零填充在这里不是单纯的长度保持技巧；由于归一化距离中的 `0` 表示贴近障碍，序列两端的零填充会形成与车体前向轴绑定的隐式方向锚点，使卷积主干在不额外加入方向位置编码的情况下区分前方左右几何。
+`env/mujoco_env.py` 包含两个入口：
 
-仓库也保留了若干可切换编码器，统一由 `config/model_config.json` 定义、由 `config/train_config.json` 的 `model` 字段选择：
+- `MujocoNavEnv` 是标准 Gymnasium 单环境，可用于示例程序、Notebook 和学生练习。
+- `MujocoBatchEnv` 管理多个独立 MuJoCo 场景，并把观测、奖励、终止状态转换为 PPO 训练器使用的 PyTorch 张量。
 
-| Key | Encoder | 用途 |
-|---|---|---|
-| `cnn_zeropad` | 零填充空洞一维卷积 + 姿态 MLP | 论文方法主干 |
-| `cnn_circular` | 环形填充空洞一维卷积 + 姿态 MLP | 保留射线环形拓扑的可选结构 |
-| `circular_attn` | 环形卷积 + 多查询多头注意力 | 可选注意力结构 |
-| `mlp_2` 至 `mlp_5` | 直接处理扁平观测向量的 MLP | 简单基线结构 |
+环境在 CPU 上生成场景并计算射线；策略网络仍可在 CPU 或 CUDA 上运行。默认使用 8 个环境，实际训练速度取决于 CPU、策略网络和射线数量。
 
 ## 观测与动作
 
@@ -30,149 +26,161 @@ GRALP 是一个面向移动机器人局部导航与轨迹规划的轻量级 PPO 
  sin_goal, cos_goal,
  prev_vx_norm, prev_omega_norm,
  delta_vx_norm, delta_omega_norm,
- task_dist_norm]
+ goal_distance_norm]
 ```
 
-其中 `R = ceil(2 * pi * patch_meters / ray_max_gap)`。当前默认配置下 `patch_meters = 10.0`、`ray_max_gap = 0.6`，因此 `R = 105`，观测维度为 `112`。修改这两个参数会改变观测维度，已有 checkpoint 和 ONNX 模型通常不能继续兼容。
+`R = ceil(2 * pi * patch_meters / ray_max_gap)`。默认 `patch_meters = 10.0`、`ray_max_gap = 0.6`，所以 `R = 105`、观测维度为 `112`。射线按机器人朝向排列，距离归一化到 `[0, 1]`。
 
-动作为二维 `(vx, omega)`：
+动作是以物理单位表示的 `(vx, omega)`，分别为米/秒和弧度/秒。默认 `vx_forward_only = true`，所以线速度范围为 `[0, vx_max]`，角速度范围为 `[-omega_max, omega_max]`。策略内部的 tanh 高斯输出会映射到这些边界。
 
-- `vx_forward_only = true` 时，`vx` 被映射到 `[0, vx_max]`，策略不会输出后退速度。
-- `omega` 被映射到 `[-omega_max, omega_max]`。
-- 训练时环境向策略提供形状为 `[action_dim, 2]` 的动作上下界；导出的 ONNX 图使用 `obs` 和 `limits` 作为输入。
+修改 `patch_meters` 或 `ray_max_gap` 会改变射线数和观测维度；修改动作边界会改变策略动作的物理含义。此类变更通常需要重新训练，并同步更新部署配置。
 
-## 随机化训练环境
+策略编码器由 `config/train_config.json` 的 `model` 字段选择，结构参数位于 `config/model_config.json`。当前默认 `circular_attn` 使用环形卷积与多查询注意力处理雷达射线；`cnn_zeropad`、`cnn_circular` 和 `mlp_2` 至 `mlp_5` 可用于比较不同编码方式。不同结构的 checkpoint 不能互换。
 
-训练环境位于 `env/sim_gpu_env.py`。它不是固定地图仿真，而是每步在 GPU 上批量重采样一圈射线距离：
+## 奖励和场景配置
 
-- `blank_ratio_base`、`blank_ratio_randmax`、`blank_ratio_std_ratio` 控制每个子环境中的空射线比例分布。
-- `narrow_passage_gaussian` 打开后，障碍距离按半高斯分布采样，使近距离障碍和窄通道情形出现得更频繁。
-- 任务点从当前射线可见方向中采样，并被投影为当前视线内最近可见的局部目标点。
-- 奖励由目标进度、速度耦合碰撞惩罚和控制平滑性惩罚组成。
+环境配置位于 `config/env_config.json`：
 
-![Blank ratio distribution](assets/blank_ratio_distribution.png)
+| 部分 | 常用参数 | 含义 |
+|---|---|---|
+| `world` | `arena_size`、`obstacle_count`、`obstacle_min_size`、`obstacle_max_size` | 场地尺寸和随机障碍数量、尺寸 |
+| `world` | `wall_thickness`、`robot_radius` | 围墙厚度和机器人 footprint 半径 |
+| `obs` | `patch_meters`、`ray_max_gap` | LiDAR 量程和射线间距 |
+| `sim` | `dt`、`max_episode_steps`、`task_point_success_radius_m` | 控制周期、最大步数和目标判定半径 |
+| `limits` | `vx_max`、`omega_max`、`vx_forward_only` | 差速动作边界 |
+| `reward` | `reward_progress`、`reward_collision`、`reward_success` | 目标进度、碰撞惩罚和到达奖励 |
+
+奖励由目标距离变化、碰撞惩罚、到达目标奖励和动作平滑惩罚组成。固定相同随机种子可复现起始场景；不传种子时，每次 reset 都会重新采样地图和任务。
 
 ## 安装
 
-先安装基础依赖：
+先安装项目依赖，再按本机设备安装 PyTorch：
 
 ```bash
 pip install -r requirements.txt
-```
 
-再按设备安装 PyTorch。示例：
-
-```bash
-# CPU
+# CPU PyTorch
 pip install torch --index-url https://download.pytorch.org/whl/cpu
 
-# CUDA 12.1
+# CUDA 12.1 PyTorch
 pip install torch --index-url https://download.pytorch.org/whl/cu121
 ```
 
-`tools/export_onnx.py` 需要 `torch` 和 `onnxruntime`。如果要在 GPU 上做 ONNX 推理或导出校验，可将 `onnxruntime` 换成 `onnxruntime-gpu`。
+MuJoCo Python 包、Gymnasium 和 TensorBoard 已列入 `requirements.txt`。运行交互窗口需要桌面图形环境；无桌面环境可以使用 `render_mode="rgb_array"` 做离屏渲染。导出 ONNX 还需要 `onnx` 和 `onnxruntime`。
 
-## 配置
+## Gymnasium 示例
 
-主要配置文件都在 `config/`：
+单环境使用标准 Gymnasium 返回值：`reset()` 返回 `(observation, info)`，`step(action)` 返回 `(observation, reward, terminated, truncated, info)`。
 
-| 文件 | 作用 |
-|---|---|
-| `train_config.json` | PPO 采样规模、优化超参、日志和 checkpoint 设置，并通过 `model` 字段选择编码器 |
-| `env_config.json` | 速度边界、仿真周期、任务点采样、奖励权重和射线观测参数 |
-| `model_config.json` | 各类编码器的结构参数 |
+```python
+import json
+from env.mujoco_env import MujocoNavConfig, MujocoNavEnv
 
-如果要按论文方法训练，请确认 `config/train_config.json` 中：
+with open("config/env_config.json", encoding="utf-8") as f:
+    config = MujocoNavConfig.from_dict(json.load(f))
 
-```json
-"model": "cnn_zeropad"
+env = MujocoNavEnv(config, render_mode="human")
+observation, info = env.reset(seed=7)
+observation, reward, terminated, truncated, info = env.step([0.2, 0.0])
+env.close()
 ```
 
-当前仓库也允许选择 `cnn_circular`、`circular_attn` 或 `mlp_*`，但不同结构训练出的权重不能混用。
+## 课堂演示
 
-## 训练
-
-训练入口是 `rl_ppo.train`：
+启动随机地图和简单目标点控制器：
 
 ```bash
-# 新建一次训练，生成 runs/<timestamp>[-<tag>]/
-python -m rl_ppo.train --fresh --tag cnn_zeropad
-
-# 新建目录并从已有 checkpoint 或 tag 热启动
-python -m rl_ppo.train --fresh --resume <path-or-tag> --tag finetune
-
-# 在已有 run 上继续训练
-python -m rl_ppo.train --resume <path-or-tag>
+python -m tools.mujoco_demo --seed 0 --episodes 5
 ```
 
-说明：
-
-- `--fresh` 会创建新的 run 目录，并把当前 `train_config.json`、`env_config.json`、`model_config.json` 复制进去。
-- `--resume` 可以传 run 目录、具体 `step-<N>.pt`、`latest.pt`，或已有 tag。
-- 纯 `--resume` 会加载优化器状态；`--fresh --resume` 默认只加载策略权重，如需同时加载优化器状态可加 `--opt`。
-- TensorBoard 会随训练自动启动，默认端口为 `6006`，可用 `--port` 修改。
-
-## 导出 ONNX
-
-训练完成后可以把 checkpoint 导出成自包含的 `model/` 文件夹：
+也可以用随机动作观察环境响应：
 
 ```bash
-# 按 tag 定位最新 run
-python tools/export_onnx.py --tag cnn_zeropad
-
-# 指定某个 checkpoint
-python tools/export_onnx.py --ckpt runs/<run>/latest.pt --model cnn_zeropad
-
-# 指定输出目录
-python tools/export_onnx.py --ckpt runs/<run>/latest.pt --model cnn_zeropad -o exported_model
+python -m tools.mujoco_demo --controller random --seed 0 --episodes 2
 ```
 
-导出产物：
+演示控制器不是学习策略。课堂上可以依次查看观测中的激光距离和目标方向，讨论碰撞惩罚、到达奖励，再启动 PPO 训练并比较训练前后的行为。
 
-```text
-model/
-├── policy.pt
-├── policy.onnx
-└── meta.json
+## PPO 训练
+
+`config/train_config.json` 选择策略网络、并行环境数、rollout 长度、优化参数和总环境步数。默认设置使用 `circular_attn`、8 个环境和 200 万环境步。课堂试跑可以先减少 `run.total_env_steps`；增加障碍数量或射线数量会提高环境计算开销。
+
+```bash
+# 使用当前配置新建训练 run
+python -m rl_ppo.train --fresh --tag mujoco
+
+# 从 checkpoint 权重开始一组新实验
+python -m rl_ppo.train --fresh --resume runs/<run>/latest.pt --tag finetune
+
+# 在原 run 上恢复训练，包括优化器状态
+python -m rl_ppo.train --resume runs/<run>
 ```
 
-`policy.onnx` 的输入为 `obs` 和 `limits`，输出为确定性动作 `action`、预压缩均值 `mu` 和 `log_std`。导出脚本会用同一批随机输入分别运行 PyTorch 和 ONNX Runtime，确认数值一致后才完成。
+每次新训练会把训练配置、环境配置和模型配置复制到 `runs/<run>/`，便于复现实验。`--fresh --resume` 默认只载入策略权重；加 `--opt` 才同时恢复优化器状态。TensorBoard 默认使用端口 `6006`，可通过 `--port` 更改。
+
+在主机桌面上实时查看 PPO 训练的第 0 个环境：
+
+```bash
+python3 -u -m rl_ppo.train --fresh --tag mujoco_visual --render --render-every 5 --render-fps 30
+```
+
+`--render-every` 指定每隔多少个批量环境步刷新窗口，`--render-fps 0` 取消显示限速。可加 `--total-env-steps 2048` 做短训练检查；省略则使用配置中的总步数。关闭窗口会保存 checkpoint 并停止训练。主机浏览器访问 `http://localhost:6006` 查看 TensorBoard 曲线。在 SSH 中启动时，需要把 `DISPLAY`、`XAUTHORITY` 设置为远程主机桌面会话的值。
+
+## 评估与导出
+
+加载 checkpoint 做纯可视化测试（冻结权重、确定性动作，默认 10 Hz；配置来自 checkpoint 所在 run）：
+
+```bash
+cd /home/pc/AIRC-ROS2-Istruction
+
+python3 -u -m tools.mujoco_policy_test \
+  --ckpt runs/20261118-195211-mujoco/step-258998272.pt \
+  --seed 10000 \
+  --episodes 64 \
+  --fps 10
+```
+
+快速无窗口评估同一组场景：
+
+```bash
+cd /home/pc/AIRC-ROS2-Istruction
+
+python3 -u -m tools.mujoco_policy_test \
+  --ckpt runs/20261118-195211-mujoco/step-258998272.pt \
+  --seed 10000 --episodes 64 --headless
+```
+
+`--headless` 可无窗口快速评估；`--fps 0` 可不限制显示速度。每个回合使用 `seed + 回合序号`，终端打印成功、碰撞或超时以及奖励。测试不会创建训练 run 或修改权重，关闭窗口或按 Ctrl+C 退出。
+
+窄通道评估可以比较 DWA 与训练策略在固定地图上的表现：
+
+```bash
+python -m eval.scripts.narrow_channel_eval --ckpt runs/<run>/latest.pt --render
+```
+
+导出 checkpoint 为 ONNX：
+
+```bash
+python tools/export_onnx.py --ckpt runs/<run>/latest.pt --model circular_attn -o exported_model
+```
+
+导出目录包含 PyTorch 权重、ONNX 文件和描述动作边界等信息的 `meta.json`。改变编码器、观测维度或动作范围后，需使用匹配的配置加载权重。
 
 ## 代码结构
 
 ```text
-GRALP/
-├── config/
-│   ├── env_config.json          # 环境、观测、动作边界和奖励配置
-│   ├── model_config.json        # 编码器结构配置
-│   └── train_config.json        # PPO 训练与运行配置
+AIRC-ROS2-Istruction/
+├── config/                 # 训练、场景和模型配置
 ├── env/
-│   ├── sim_gpu_env.py           # 批量随机化射线环境
-│   ├── ray.py                   # 射线数量和射线扫描工具
-│   └── utils.py                 # JSON 配置与日志工具
-├── models/
-│   ├── policy.py                # PPOPolicy：tanh 高斯策略 + 价值头
-│   └── encoders/
-│       ├── cnn_zeropad.py       # 零填充空洞一维卷积编码器
-│       ├── cnn_circular.py      # 环形填充一维卷积编码器
-│       ├── circular_attn.py     # 环形卷积注意力编码器
-│       └── mlp.py               # MLP 编码器
-├── rl_ppo/
-│   ├── train.py                 # PPO 训练入口
-│   ├── buffer.py                # rollout buffer 与 GAE
-│   └── writer.py                # TensorBoard 日志工具
+│   ├── mujoco_env.py       # Gymnasium MuJoCo 场景及 PPO 批量适配器
+│   ├── ray.py              # 射线工具（旧评估代码兼容）
+│   └── utils.py            # 配置和日志工具
+├── models/                 # PPO 策略与可选观测编码器
+├── rl_ppo/                 # rollout、GAE、PPO 训练循环
+├── eval/                   # DWA 和固定地图评估
 ├── tools/
-│   ├── export_onnx.py           # checkpoint 到 ONNX/model 文件夹
-│   └── analyze_blank_ratio.py   # blank_ratio 分布可视化工具
-├── assets/                      # README 图片资源
-├── runs/                        # 训练输出目录
-├── requirements.txt
-└── README.md
+│   ├── mujoco_demo.py      # 交互式场景演示
+│   ├── mujoco_policy_test.py # 冻结策略的可视化测试和无窗口评估
+│   └── export_onnx.py      # 模型导出
+└── runs/                   # 训练日志和 checkpoint
 ```
-
-## 使用注意
-
-- 修改 `patch_meters` 或 `ray_max_gap` 会改变射线数和观测维度，需要重新训练或重新导出匹配模型。
-- 修改 `train_config.json` 的 `model` 后，新旧 checkpoint 只有在编码器结构完全一致时才能加载。
-- `vx_forward_only` 会改变动作边界和上一帧速度的归一化方式，部署侧需要使用 `meta.json` 中记录的同一动作约束。
-- `runs/` 目录通常包含大量 checkpoint，提交代码时应只保留确实需要发布的模型文件。

@@ -24,7 +24,7 @@ import torch
 from .buffer import RolloutBuffer
 from .writer import close_writer, get_writer, init_writer
 from env import load_json_config
-from env.sim_gpu_env import SimGPUEnvConfig, SimRandomGPUBatchEnv, infer_obs_dim as _infer_obs_dim_sim
+from env.mujoco_env import MujocoBatchEnv
 from models import PPOPolicy, build_encoder, resolve_model_entry
 
 
@@ -40,7 +40,7 @@ def load_train_config(path: Optional[str]) -> Dict[str, Any]:
     cfg.setdefault("model_config", "model_config.json")
     cfg.setdefault("model", "circular_attn")
     samp = cfg.setdefault("sampling", {})
-    samp.setdefault("batch_env", 256)
+    samp.setdefault("batch_env", 16)
     samp.setdefault("rollout_len", 128)
     samp.setdefault("reset_each_rollout", True)
     ppo = cfg.setdefault("ppo", {})
@@ -211,6 +211,14 @@ def _parse_cli():
                         help="Also load optimizer state on warm-start (only valid with --fresh --resume; pure --resume always loads it)")
     parser.add_argument("--port", type=int, default=6006,
                         help="TensorBoard server port (default: 6006)")
+    parser.add_argument("--render", action="store_true",
+                        help="Show the first PPO training environment in a MuJoCo window")
+    parser.add_argument("--render-every", type=int, default=1,
+                        help="Update the viewer every N vector steps (default: 1)")
+    parser.add_argument("--render-fps", type=float, default=0.0,
+                        help="Cap viewer updates per second; 0 runs without pacing")
+    parser.add_argument("--total-env-steps", type=int, default=None,
+                        help="Override the target environment steps, saved to the run config")
     args = parser.parse_args()
     if not args.fresh and not args.resume:
         parser.error("at least one of --fresh or --resume is required")
@@ -218,6 +226,10 @@ def _parse_cli():
         parser.error("--tag is only valid with --fresh")
     if args.opt and not (args.fresh and args.resume):
         parser.error("--opt is only valid with --fresh --resume")
+    if args.render_every < 1 or args.render_fps < 0:
+        parser.error("--render-every must be >= 1 and --render-fps must be >= 0")
+    if args.total_env_steps is not None and args.total_env_steps < 1:
+        parser.error("--total-env-steps must be >= 1")
     return args
 
 
@@ -270,6 +282,11 @@ def main():
     if not os.path.isfile(model_cfg_path):
         raise FileNotFoundError(f"Missing model_config.json in {run_dir}")
     cfg = load_train_config(train_cfg_path)
+    if args.total_env_steps is not None:
+        import json
+        cfg["run"]["total_env_steps"] = args.total_env_steps
+        with open(train_cfg_path, "w", encoding="utf-8") as f:
+            json.dump(cfg, f, indent=2)
     env_cfg = load_json_config(env_cfg_path)
     model_configs = load_json_config(model_cfg_path)
 
@@ -277,10 +294,6 @@ def main():
         cfg.get("device", "cuda:0") if (cfg.get("device", "cuda:0") == "cpu" or torch.cuda.is_available()) else "cpu"
     )
 
-    obs_cfg = env_cfg.get("obs", {}) or {}
-    sim_cfg = env_cfg.get("sim", {}) or {}
-    lim_cfg = env_cfg.get("limits", {}) or {}
-    rew_cfg = env_cfg.get("reward", {}) or {}
     ppo_cfg = cfg.get("ppo", {}) or {}
 
     B_env = int((cfg.get("sampling", {}) or {}).get("batch_env", 256))
@@ -289,37 +302,13 @@ def main():
     run_seed = _extract_seed_from_train_or_env(cfg, env_cfg)
     if run_seed is not None:
         torch.manual_seed(int(run_seed))
-    safe_dist = float(sim_cfg.get("safe_distance", sim_cfg.get("warning_distance", 0.5)))
-    sim = SimGPUEnvConfig(
-        dt=float(sim_cfg.get("dt", 0.1)),
-        n_envs=B_env,
-        patch_meters=float(obs_cfg.get("patch_meters", 10.0)),
-        ray_step_m=float(obs_cfg.get("ray_step_m", 0.025)),
-        n_rays=int(obs_cfg.get("n_rays", 0)),
-        ray_max_gap=float(obs_cfg.get("ray_max_gap", 0.25)),
-        safe_distance_m=safe_dist,
-        vx_max=float(lim_cfg.get("vx_max", 1.5)),
-        omega_max=float(lim_cfg.get("omega_max", 2.0)),
-        vx_forward_only=bool(lim_cfg.get("vx_forward_only", False)),
-        w_collision=float(rew_cfg.get("reward_collision", 1.0)),
-        w_progress=float(rew_cfg.get("reward_progress", 0.01)),
-        orientation_verify=bool(rew_cfg.get("orientation_verify", False)),
-        w_jerk=float(rew_cfg.get("reward_jerk", 0.0)),
-        w_jerk_omega=float(rew_cfg.get("reward_jerk_omega", 0.0)),
-        blank_ratio_base=float((obs_cfg.get("blank_ratio_base", 40.0))),
-        blank_ratio_randmax=float((obs_cfg.get("blank_ratio_randmax", 40.0))),
-        blank_ratio_std_ratio=float(obs_cfg.get("blank_ratio_std_ratio", 0.33)),
-        narrow_passage_gaussian=bool(obs_cfg.get("narrow_passage_gaussian", False)),
-        narrow_passage_std_ratio=float(obs_cfg.get("narrow_passage_std_ratio", 0.3)),
-        device=str(device),
-        task_point_max_dist_m=float(sim_cfg.get("task_point_max_dist_m", 8.0)),
-        task_point_success_radius_m=float(sim_cfg.get("task_point_success_radius_m", 0.25)),
-        task_point_random_interval_max=int(sim_cfg.get("task_point_random_interval_max", 0)),
-        collision_done=bool(ppo_cfg.get("collision_done", True)),
-    )
-    env = SimRandomGPUBatchEnv(sim)
+    env = MujocoBatchEnv(env_cfg, n_envs=B_env, device=str(device), seed=run_seed)
     obs = env.reset()
-    vec_dim = int(obs.shape[1]) if obs.dim() == 2 else int(_infer_obs_dim_sim(sim))
+    if args.render:
+        env.envs[0].render_mode = "human"
+        env.envs[0].render()
+        print("[PPO] MuJoCo viewer: environment 0, actions from the training policy")
+    vec_dim = int(obs.shape[1])
     act_dim = 2
 
     model_key = str(cfg.get("model", "circular_attn"))
@@ -388,6 +377,8 @@ def main():
     last_log_step = global_step
     last_log_time = time.time()
     last_save_step = global_step
+    render_step = 0
+    last_render_time = time.monotonic()
 
     while global_step < total_env_steps:
         if reset_each_rollout:
@@ -400,6 +391,21 @@ def main():
                 act = out.action
                 _, _, v = policy._core(obs)
                 next_obs, reward_t, done_t, info = env.step(act)
+                render_step += 1
+                if args.render and render_step % args.render_every == 0:
+                    viewer = env.envs[0]._viewer
+                    if not viewer.is_running():
+                        _save_checkpoint(run_dir, global_step + B_env, policy, opt_pi)
+                        close_writer()
+                        env.close()
+                        print("[PPO] Viewer closed; checkpoint saved, training stopped")
+                        return
+                    if args.render_fps > 0:
+                        remaining = 1.0 / args.render_fps - (time.monotonic() - last_render_time)
+                        if remaining > 0:
+                            time.sleep(remaining)
+                    env.envs[0].render()
+                    last_render_time = time.monotonic()
                 d = done_t
                 buf.add(
                     obs=obs.detach(),
@@ -471,6 +477,7 @@ def main():
 
     _save_checkpoint(run_dir, global_step, policy, opt_pi)
     close_writer()
+    env.close()
 
 
 if __name__ == "__main__":
