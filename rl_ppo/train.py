@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-"""Entry point for PPO training using the randomized GPU ray environment (map-free).
+"""Entry point for PPO training using randomized MuJoCo navigation scenes.
 
 Usage:
     python -m rl_ppo.train --fresh [--tag NAME]
@@ -373,6 +373,13 @@ def main():
     roll_reward = torch.zeros((), device=device)
     roll_collide = torch.zeros((), device=device)
     roll_steps_total = 0
+    episode_records = []
+    reset_cuts = 0
+    # Sample-weighted minibatch diagnostics over the whole logging interval.
+    diagnostic_sums = torch.zeros(7, device=device)
+    diagnostic_samples = 0
+    ev_variance_sum = torch.zeros(2, device=device)
+    ev_samples = 0
 
     last_log_step = global_step
     last_log_time = time.time()
@@ -383,6 +390,7 @@ def main():
     while global_step < total_env_steps:
         if reset_each_rollout:
             obs = env.reset()
+            reset_cuts += env.last_reset_cuts
         buf = RolloutBuffer(T_roll, B_env, obs_dim=obs.shape[1], act_dim=act_dim, device=device)
         with torch.no_grad():
             for _ in range(T_roll):
@@ -420,6 +428,7 @@ def main():
                 roll_reward += reward_t.sum()
                 roll_collide += info["collided"].to(torch.float32).sum()
                 roll_steps_total += B_env
+                episode_records.extend(info['episodes'])
 
                 global_step += B_env
                 obs = next_obs
@@ -431,6 +440,13 @@ def main():
             buf.compute_gae(last_v, gamma=gamma, lam=lam, count_timeout_as_done=True)
         else:
             buf.compute_mc_returns(gamma=gamma)
+        with torch.no_grad():
+            count = buf.returns.numel()
+            ev_variance_sum += torch.stack([
+                buf.returns.var(unbiased=False),
+                (buf.returns - buf.values).var(unbiased=False),
+            ]) * count
+            ev_samples += count
         for _ in range(epochs):
             for mb in buf.minibatches(mb_size):
                 with torch.amp.autocast("cuda", enabled=use_amp, dtype=amp_dtype):
@@ -449,25 +465,74 @@ def main():
                     scaler.unscale_(opt_pi)
                 else:
                     loss.backward()
-                torch.nn.utils.clip_grad_norm_(policy.parameters(), max_grad_norm)
+                grad_norm = torch.nn.utils.clip_grad_norm_(
+                    policy.parameters(), max_grad_norm, error_if_nonfinite=True)
+                with torch.no_grad():
+                    log_ratio = (new_logp - mb.logp).float()
+                    approx_kl = (torch.expm1(log_ratio) - log_ratio).mean()
+                    clip_fraction = (log_ratio.exp().sub(1).abs() > clip_eps).float().mean()
+                    metrics = torch.stack([pg_loss.detach().float(), v_loss.detach().float(),
+                                           loss.detach().float(), ent_bonus.detach().float(),
+                                           approx_kl, clip_fraction, grad_norm.detach().float()])
+                    if not torch.isfinite(metrics).all():
+                        raise FloatingPointError('Non-finite PPO loss/diagnostic; update stopped')
+                    diagnostic_sums += metrics * mb.obs.shape[0]
+                    diagnostic_samples += mb.obs.shape[0]
                 if scaler.is_enabled():
                     scaler.step(opt_pi)
                     scaler.update()
                 else:
                     opt_pi.step()
-        if global_step - last_log_step >= log_interval:
+        if global_step - last_log_step >= log_interval or global_step >= total_env_steps:
             now = time.time()
             fps = (global_step - last_log_step) / max(1e-3, now - last_log_time)
             n_steps = max(1, roll_steps_total)
+            names = ('policy_loss', 'value_loss', 'total_loss', 'entropy',
+                     'approx_kl', 'clip_fraction', 'grad_norm')
+            diagnostics = dict(zip(names, (diagnostic_sums / max(1, diagnostic_samples)).tolist()))
+            variance, residual = (ev_variance_sum / max(1, ev_samples)).tolist()
+            if variance > 1e-12:
+                diagnostics['explained_variance'] = 1.0 - residual / variance
+            std = policy.log_std.detach().clamp(policy._log_std_min, policy._log_std_max).exp().tolist()
+            diagnostics.update(std_vx=std[0], std_omega=std[1])
+            rollout_metrics = {'collision_rate': (roll_collide / n_steps).item(),
+                               'step_collision_rate': (roll_collide / n_steps).item(),
+                               'completed_episodes': len(episode_records),
+                               'reset_cut_episodes': reset_cuts, 'fps': fps}
+            episode_metrics = {}
+            if episode_records:
+                n = len(episode_records)
+                episode_metrics = {f'{outcome}_rate': sum(e['outcome'] == outcome for e in episode_records) / n
+                                   for outcome in ('success', 'collision', 'timeout')}
+                episode_metrics['mean_return'] = sum(e['return'] for e in episode_records) / n
+                episode_metrics['mean_length'] = sum(e['length'] for e in episode_records) / n
+                success_lengths = [e['length'] for e in episode_records if e['outcome'] == 'success']
+                if success_lengths:
+                    episode_metrics['success_mean_seconds'] = sum(success_lengths) / len(success_lengths) * env.cfg.dt
             if writer is not None:
                 writer.log({"mean_reward": (roll_reward / n_steps).item()},
                            step=global_step, scope="learner")
-                writer.log({"collision_rate": (roll_collide / n_steps).item()},
-                           step=global_step, scope="rollout")
-            print(f"[PPO] step={global_step:,} | fps={fps:.1f}")
+                writer.log(rollout_metrics, step=global_step, scope='rollout')
+                writer.log(diagnostics, step=global_step, scope='ppo')
+                if episode_metrics:
+                    writer.log(episode_metrics, step=global_step, scope='episode')
+            outcome_text = ('no completed episodes' if not episode_metrics else
+                            f"success={episode_metrics['success_rate']:.1%} "
+                            f"collision={episode_metrics['collision_rate']:.1%} "
+                            f"timeout={episode_metrics['timeout_rate']:.1%}")
+            print(f"[PPO] step={global_step:,} | fps={fps:.1f} | reward={(roll_reward/n_steps).item():.4f} | "
+                  f"pi_loss={diagnostics['policy_loss']:.4f} v_loss={diagnostics['value_loss']:.4f} "
+                  f"KL={diagnostics['approx_kl']:.4f} clip={diagnostics['clip_fraction']:.1%} | "
+                  f"episodes={len(episode_records)} {outcome_text} reset_cuts={reset_cuts}", flush=True)
             roll_reward.zero_()
             roll_collide.zero_()
             roll_steps_total = 0
+            episode_records.clear()
+            reset_cuts = 0
+            diagnostic_sums.zero_()
+            diagnostic_samples = 0
+            ev_variance_sum.zero_()
+            ev_samples = 0
             last_log_step = global_step
             last_log_time = now
 

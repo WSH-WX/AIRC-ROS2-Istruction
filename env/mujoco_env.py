@@ -324,11 +324,17 @@ class MujocoBatchEnv:
         self.n_rays = self.envs[0].n_rays
         self._limits = torch.as_tensor(self.envs[0].get_limits(), device=self.device)
         self._seed = seed
+        self._episode_returns = np.zeros(self.B, dtype=np.float64)
+        self._episode_lengths = np.zeros(self.B, dtype=np.int64)
+        self.last_reset_cuts = 0
 
     def get_limits(self):
         return self._limits
 
     def reset(self):
+        self.last_reset_cuts = int(np.count_nonzero(self._episode_lengths))
+        self._episode_returns.fill(0)
+        self._episode_lengths.fill(0)
         obs = []
         for i, env in enumerate(self.envs):
             seed = None if self._seed is None else int(self._seed) + i
@@ -340,10 +346,18 @@ class MujocoBatchEnv:
         if isinstance(actions, torch.Tensor):
             actions = actions.detach().to("cpu").numpy()
         obs, rewards, dones, collided, success, timeout = [], [], [], [], [], []
+        episodes = []
         for i, (env, action) in enumerate(zip(self.envs, actions)):
             o, r, terminated, truncated, info = env.step(action)
             done = terminated or truncated
+            self._episode_returns[i] += r
+            self._episode_lengths[i] += 1
             if done:
+                outcome = 'success' if info['success'] else 'collision' if info['collided'] else 'timeout'
+                episodes.append({'outcome': outcome, 'return': float(self._episode_returns[i]),
+                                 'length': int(self._episode_lengths[i])})
+                self._episode_returns[i] = 0
+                self._episode_lengths[i] = 0
                 o = env.reset()[0]
             obs.append(o)
             rewards.append(r)
@@ -352,6 +366,7 @@ class MujocoBatchEnv:
             success.append(info["success"])
             timeout.append(truncated)
         info = {
+            "episodes": episodes,
             "collided": torch.as_tensor(collided, device=self.device),
             "success": torch.as_tensor(success, device=self.device),
             "timeout": torch.as_tensor(timeout, device=self.device),

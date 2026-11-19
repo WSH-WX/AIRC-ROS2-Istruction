@@ -27,3 +27,8 @@ Thumbs.db
 /runs/*
 !/runs/.gitkeep
 /work/
+
+# Generated demo outputs; pre_train/ is deliberately kept in Git.
+/eval_outputs/
+/exported_model/
+/logs/

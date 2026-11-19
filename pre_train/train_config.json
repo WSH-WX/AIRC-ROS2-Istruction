@@ -2,9 +2,9 @@
     "device":  "cuda:0",
     "env_config":  "env_config.json",
     "model_config":  "model_config.json",
-    "model":  "cnn_zeropad",
+    "model":  "circular_attn",
     "sampling":  {
-                     "batch_env":  2048,
+                     "batch_env":  4096,
                      "rollout_len":  256,
                      "reset_each_rollout": true
                  },
@@ -19,7 +19,7 @@
                 "value_coef":  0.5,
                 "max_grad_norm":  0.5,
                 "epochs":  1,
-                "minibatch_size":  16384,
+                "minibatch_size":  1024,
                 "amp":  true,
                 "amp_bf16":  true,
                 "collision_done":  true,

@@ -1,0 +1,10 @@
+{
+  "project": "AIRC-ROS2-Istruction",
+  "checkpoint": "policy.pt",
+  "source_checkpoint": "runs/20261118-195211-mujoco/step-260046848.pt",
+  "step": 260046848,
+  "sha256": "bf477862c9b1ee29d0f88c1922501beeae2f67c4e87275b26be22a75c5b10849",
+  "format": "Unmodified PPO checkpoint containing step, policy and opt",
+  "config_source": "runs/20261118-195211-mujoco",
+  "configs": ["train_config.json", "env_config.json", "model_config.json"]
+}
